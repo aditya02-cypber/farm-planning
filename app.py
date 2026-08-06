@@ -141,7 +141,7 @@ estimate based on average figures, not a guarantee."""
 @st.cache_resource
 def build_agent(_api_key):
     return create_agent(
-        model="google_genai:gemini-2.5-flash",
+        model="google_genai:gemini-3.6-flash",
         tools=TOOLS,
         system_prompt=SYSTEM_PROMPT,
     )
