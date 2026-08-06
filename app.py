@@ -15,6 +15,42 @@ st.set_page_config(
 )
 
 st.sidebar.title("SET API CONFIG")
+
+# --- Background: sunrise over crop rows (free, Unsplash License, no attribution required) ---
+BACKGROUND_IMAGE_URL = "https://images.unsplash.com/photo-1663263687797-c0d079b662b7?fm=jpg&q=80&w=2400&auto=format&fit=crop"
+
+st.markdown(
+    f"""
+    <style>
+    [data-testid="stAppViewContainer"] {{
+        background-image: linear-gradient(rgba(10, 20, 10, 0.55), rgba(10, 20, 10, 0.65)),
+                           url("{BACKGROUND_IMAGE_URL}");
+        background-size: cover;
+        background-position: center;
+        background-attachment: fixed;
+    }}
+    [data-testid="stHeader"] {{
+        background: rgba(0, 0, 0, 0);
+    }}
+    [data-testid="stSidebar"] {{
+        background-color: rgba(20, 30, 20, 0.75);
+        backdrop-filter: blur(4px);
+    }}
+    .stApp, .stApp p, .stApp label, .stApp span {{
+        color: #f2f2ea;
+    }}
+    [data-testid="stChatMessage"] {{
+        background-color: rgba(255, 255, 255, 0.9);
+        border-radius: 12px;
+    }}
+    [data-testid="stChatMessage"] p {{
+        color: #1a1a1a;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🌾 Farm Planning & Profit Estimator (AGR-02)")
 st.caption("Agent + Calculator Tool · Season/Location Crop Recommendation · Profit Estimation")
 
