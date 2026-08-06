@@ -1,7 +1,6 @@
 # ============ STEP 1: LOAD MODULES ============
 import os
 import json
-import requests
 import pandas as pd
 import streamlit as st
 
@@ -62,7 +61,7 @@ st.markdown(
 )
 
 st.title("🌾 Farm Planning & Profit Estimator (AGR-02)")
-st.caption("Agent + Calculator Tool · NASA POWER Climate Data · Season/Location Crop Recommendation · Profit Estimation")
+st.caption("Agent + Calculator Tool · Season/Location Crop Recommendation · Profit Estimation")
 
 GOOGLE_API_KEY = st.sidebar.text_input("GOOGLE_API_KEY", type="password")
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
@@ -115,17 +114,6 @@ CROP_ECONOMICS = {
     "fodder crops":{"yield_per_acre": 120,"price_per_quintal": 400},
 }
 
-# Approximate centroid coordinates for each region (used so the agent/chart can
-# fetch NASA climate data even if the user only names a region, not exact coordinates).
-REGION_COORDS = {
-    "north": (28.61, 77.21),   # Delhi
-    "south": (13.08, 80.27),   # Chennai
-    "east":  (22.57, 88.36),   # Kolkata
-    "west":  (19.08, 72.88),   # Mumbai
-}
-
-MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
-
 # ==================== STEP 4: CORE LOGIC (plain functions, reused by tools + UI) ====================
 def estimate_profit(crop: str, land_acres: float, total_cost_rs: float,
                      yield_per_acre_override: float = 0, price_per_quintal_override: float = 0) -> dict:
@@ -157,38 +145,6 @@ def estimate_profit(crop: str, land_acres: float, total_cost_rs: float,
         "net_profit_rs": round(net_profit, 2),
         "roi_percent": round(roi_pct, 2),
     }
-
-
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def fetch_nasa_power_climatology(latitude: float, longitude: float) -> dict:
-    """Fetch long-term monthly climate normals from NASA POWER — a free, public,
-    satellite/reanalysis-derived agroclimatology dataset (no API key required).
-    Returns average temperature (°C), precipitation (mm/day), and solar radiation
-    (kWh/m^2/day) for each calendar month at the given coordinates."""
-    url = "https://power.larc.nasa.gov/api/temporal/monthly/climatology/point"
-    params = {
-        "parameters": "T2M,PRECTOTCORR,ALLSKY_SFC_SW_DWN",
-        "community": "AG",
-        "longitude": longitude,
-        "latitude": latitude,
-        "format": "JSON",
-    }
-    resp = requests.get(url, params=params, timeout=20)
-    resp.raise_for_status()
-    payload = resp.json()
-    if "properties" not in payload:
-        raise ValueError(f"Unexpected response from NASA POWER: {payload}")
-    param_data = payload["properties"]["parameter"]
-
-    rows = []
-    for m in MONTHS:
-        rows.append({
-            "month": m,
-            "avg_temp_C": param_data.get("T2M", {}).get(m),
-            "avg_rainfall_mm_day": param_data.get("PRECTOTCORR", {}).get(m),
-            "avg_solar_kwh_m2_day": param_data.get("ALLSKY_SFC_SW_DWN", {}).get(m),
-        })
-    return {"source": "NASA POWER (power.larc.nasa.gov), community=AG", "monthly": rows}
 
 
 # ==================== STEP 5: LANGCHAIN TOOLS ====================
@@ -223,20 +179,7 @@ def profit_calculator_tool(crop: str, land_acres: float, total_cost_rs: float,
     return json.dumps(result, indent=2)
 
 
-@tool
-def nasa_climate_tool(latitude: float, longitude: float) -> str:
-    """Fetch real NASA POWER long-term average monthly temperature, rainfall, and solar
-    radiation for a farm location, to ground crop and irrigation planning in actual
-    satellite/reanalysis climate data instead of guesses. If the user only gave a region
-    name (north/south/east/west) rather than coordinates, use its approximate centroid."""
-    try:
-        data = fetch_nasa_power_climatology(latitude, longitude)
-    except Exception as e:
-        return f"Could not fetch NASA POWER climate data: {e}"
-    return json.dumps(data, indent=2)
-
-
-TOOLS = [crop_recommendation_tool, profit_calculator_tool, nasa_climate_tool]
+TOOLS = [crop_recommendation_tool, profit_calculator_tool]
 
 
 def extract_text(content) -> str:
@@ -257,18 +200,13 @@ def extract_text(content) -> str:
 
 # ==================== STEP 6: BUILD THE AGENT ====================
 SYSTEM_PROMPT = """You are an agricultural planning assistant for Indian farmers.
-You help with three things:
+You help with two things:
 1. Recommending suitable crops for a season (kharif/rabi/zaid) and region (north/south/east/west) using crop_recommendation_tool.
 2. Estimating farming profit using profit_calculator_tool (needs crop name, land in acres, total estimated cost in rupees).
-3. Grounding advice in real NASA satellite/reanalysis climate data using nasa_climate_tool (needs latitude and longitude;
-   if the user only gives a region name, use these approximate centroids: north=(28.61,77.21), south=(13.08,80.27),
-   east=(22.57,88.36), west=(19.08,72.88)).
 
 Always use the tools for factual/numeric answers instead of guessing. If the user hasn't given enough
-details ask a short clarifying question before calling a tool. When climate data is available, mention
-anything notable (e.g. a dry month during the growing season) alongside the crop recommendation.
-Explain results in simple, farmer-friendly language, and mention profit figures are estimates based on
-average data, not a guarantee."""
+details ask a short clarifying question before calling a tool. Explain results in simple, farmer-friendly
+language, and mention profit figures are estimates based on average data, not a guarantee."""
 
 @st.cache_resource
 def build_agent(_api_key):
@@ -279,7 +217,7 @@ def build_agent(_api_key):
     )
 
 # ==================== STEP 7: TABBED LAYOUT ====================
-tab_chat, tab_calc, tab_climate = st.tabs(["💬 Chat Advisor", "🧮 Profit Calculator", "🛰️ NASA Climate Data"])
+tab_chat, tab_calc = st.tabs(["💬 Chat Advisor", "🧮 Profit Calculator"])
 
 # ---------- TAB 1: CHAT ADVISOR ----------
 with tab_chat:
@@ -365,56 +303,3 @@ with tab_calc:
         )
     else:
         st.info("Enter your crop, land size, and cost above, then click Calculate Profit.")
-
-# ---------- TAB 3: NASA CLIMATE DATA ----------
-with tab_climate:
-    st.subheader("NASA POWER Climate Normals")
-    st.caption(
-        "Real long-term monthly climate data from NASA's POWER project (power.larc.nasa.gov) — "
-        "the same public agroclimatology dataset used in food-security and land-monitoring research."
-    )
-
-    region_choice = st.selectbox("Quick-fill from region", ["Custom", "North", "South", "East", "West"])
-    if region_choice != "Custom":
-        default_lat, default_lon = REGION_COORDS[region_choice.lower()]
-    else:
-        default_lat, default_lon = 20.59, 78.96  # India centroid
-
-    lc1, lc2 = st.columns(2)
-    with lc1:
-        lat = st.number_input("Latitude", value=float(default_lat), format="%.4f")
-    with lc2:
-        lon = st.number_input("Longitude", value=float(default_lon), format="%.4f")
-
-    if st.button("Fetch NASA Climate Data"):
-        with st.spinner("Contacting NASA POWER API..."):
-            try:
-                climate = fetch_nasa_power_climatology(lat, lon)
-                st.session_state["last_climate"] = climate
-            except Exception as e:
-                st.error(f"Could not fetch NASA climate data: {e}")
-
-    if "last_climate" in st.session_state:
-        climate = st.session_state["last_climate"]
-        df = pd.DataFrame(climate["monthly"]).set_index("month")
-
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.markdown("**Avg Temperature (°C)**")
-            st.line_chart(df[["avg_temp_C"]])
-        with cc2:
-            st.markdown("**Avg Rainfall (mm/day)**")
-            st.bar_chart(df[["avg_rainfall_mm_day"]])
-
-        st.markdown("**Avg Solar Radiation (kWh/m²/day)**")
-        st.line_chart(df[["avg_solar_kwh_m2_day"]])
-
-        st.caption(f"Source: {climate['source']}")
-
-        csv_bytes = df.reset_index().to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Climate Data as CSV",
-            data=csv_bytes,
-            file_name=f"nasa_power_climatology_{lat}_{lon}.csv",
-            mime="text/csv",
-        )
