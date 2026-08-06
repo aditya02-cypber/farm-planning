@@ -4,7 +4,7 @@ import json
 import pandas as pd
 import streamlit as st
 
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -210,10 +210,10 @@ language, and mention profit figures are estimates based on average data, not a 
 
 @st.cache_resource
 def build_agent(_api_key):
-    return create_agent(
+    return create_react_agent(
         model="google_genai:gemini-3.6-flash",
         tools=TOOLS,
-        system_prompt=SYSTEM_PROMPT,
+        prompt=SYSTEM_PROMPT,
     )
 
 # ==================== STEP 7: TABBED LAYOUT ====================
