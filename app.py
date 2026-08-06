@@ -1,13 +1,15 @@
 # ============ STEP 1: LOAD MODULES ============
 import os
 import json
+import requests
+import pandas as pd
 import streamlit as st
 
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage
 
-# =============STEP 2: API KEYS=====================
+# =============STEP 2: PAGE CONFIG & BACKGROUND=====================
 st.set_page_config(
     page_title="Farm Planning & Profit Estimator",
     page_icon="🌾",
@@ -29,39 +31,44 @@ st.markdown(
         background-position: center;
         background-attachment: fixed;
     }}
-    [data-testid="stHeader"] {{
-        background: rgba(0, 0, 0, 0);
-    }}
+    [data-testid="stHeader"] {{ background: rgba(0, 0, 0, 0); }}
     [data-testid="stSidebar"] {{
         background-color: rgba(20, 30, 20, 0.75);
         backdrop-filter: blur(4px);
     }}
-    .stApp, .stApp p, .stApp label, .stApp span {{
-        color: #f2f2ea;
-    }}
+    .stApp, .stApp p, .stApp label, .stApp span {{ color: #f2f2ea; }}
     [data-testid="stChatMessage"] {{
         background-color: rgba(255, 255, 255, 0.9);
         border-radius: 12px;
     }}
-    [data-testid="stChatMessage"] p {{
-        color: #1a1a1a;
+    [data-testid="stChatMessage"] * {{ color: #1a1a1a !important; }}
+    [data-testid="stChatMessage"] a {{ color: #0b5c1f !important; text-decoration: underline; }}
+    [data-testid="stChatMessage"] code {{
+        background-color: rgba(0, 0, 0, 0.06);
+        color: #1a1a1a !important;
+        padding: 1px 4px;
+        border-radius: 4px;
     }}
+    [data-testid="stMetric"] {{
+        background-color: rgba(255, 255, 255, 0.92);
+        border-radius: 12px;
+        padding: 12px;
+    }}
+    [data-testid="stMetric"] label, [data-testid="stMetric"] div {{ color: #1a1a1a !important; }}
+    [data-testid="stTabs"] button p {{ color: #f2f2ea; font-weight: 600; }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.title("🌾 Farm Planning & Profit Estimator (AGR-02)")
-st.caption("Agent + Calculator Tool · Season/Location Crop Recommendation · Profit Estimation")
+st.caption("Agent + Calculator Tool · NASA POWER Climate Data · Season/Location Crop Recommendation · Profit Estimation")
 
-GOOGLE_API_KEY = st.sidebar.text_input(
-    "GOOGLE_API_KEY",
-    type="password")
+GOOGLE_API_KEY = st.sidebar.text_input("GOOGLE_API_KEY", type="password")
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
 # ==================== STEP 3: STATIC KNOWLEDGE BASE ====================
 # Simple season/location -> crop suitability table.
-# In a fuller build this would come from an agri-database or weather API.
 CROP_DATA = {
     "kharif": {
         "north":  ["Rice", "Maize", "Cotton", "Soybean"],
@@ -84,7 +91,6 @@ CROP_DATA = {
 }
 
 # Rough average market price (Rs/quintal) and yield (quintal/acre) reference table.
-# Used by the calculator tool for profit estimation.
 CROP_ECONOMICS = {
     "rice":        {"yield_per_acre": 22, "price_per_quintal": 2100},
     "maize":       {"yield_per_acre": 25, "price_per_quintal": 1900},
@@ -109,7 +115,83 @@ CROP_ECONOMICS = {
     "fodder crops":{"yield_per_acre": 120,"price_per_quintal": 400},
 }
 
-# ==================== STEP 4: CUSTOM TOOLS ====================
+# Approximate centroid coordinates for each region (used so the agent/chart can
+# fetch NASA climate data even if the user only names a region, not exact coordinates).
+REGION_COORDS = {
+    "north": (28.61, 77.21),   # Delhi
+    "south": (13.08, 80.27),   # Chennai
+    "east":  (22.57, 88.36),   # Kolkata
+    "west":  (19.08, 72.88),   # Mumbai
+}
+
+MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+
+# ==================== STEP 4: CORE LOGIC (plain functions, reused by tools + UI) ====================
+def estimate_profit(crop: str, land_acres: float, total_cost_rs: float,
+                     yield_per_acre_override: float = 0, price_per_quintal_override: float = 0) -> dict:
+    """Core profit-estimation logic. Raises ValueError if crop is unknown and no overrides given."""
+    crop_key = crop.strip().lower()
+    econ = CROP_ECONOMICS.get(crop_key)
+    if not econ and (not yield_per_acre_override or not price_per_quintal_override):
+        raise ValueError(
+            f"No default economic data for '{crop}'. Supply yield_per_acre_override and "
+            f"price_per_quintal_override, or pick a known crop."
+        )
+
+    yield_per_acre = yield_per_acre_override or econ["yield_per_acre"]
+    price_per_quintal = price_per_quintal_override or econ["price_per_quintal"]
+
+    total_yield = yield_per_acre * land_acres
+    gross_revenue = total_yield * price_per_quintal
+    net_profit = gross_revenue - total_cost_rs
+    roi_pct = (net_profit / total_cost_rs * 100) if total_cost_rs > 0 else 0
+
+    return {
+        "crop": crop,
+        "land_acres": land_acres,
+        "assumed_yield_per_acre_quintal": yield_per_acre,
+        "assumed_price_per_quintal_rs": price_per_quintal,
+        "total_expected_yield_quintal": round(total_yield, 2),
+        "gross_revenue_rs": round(gross_revenue, 2),
+        "total_cost_rs": total_cost_rs,
+        "net_profit_rs": round(net_profit, 2),
+        "roi_percent": round(roi_pct, 2),
+    }
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def fetch_nasa_power_climatology(latitude: float, longitude: float) -> dict:
+    """Fetch long-term monthly climate normals from NASA POWER — a free, public,
+    satellite/reanalysis-derived agroclimatology dataset (no API key required).
+    Returns average temperature (°C), precipitation (mm/day), and solar radiation
+    (kWh/m^2/day) for each calendar month at the given coordinates."""
+    url = "https://power.larc.nasa.gov/api/temporal/monthly/climatology/point"
+    params = {
+        "parameters": "T2M,PRECTOTCORR,ALLSKY_SFC_SW_DWN",
+        "community": "AG",
+        "longitude": longitude,
+        "latitude": latitude,
+        "format": "JSON",
+    }
+    resp = requests.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    if "properties" not in payload:
+        raise ValueError(f"Unexpected response from NASA POWER: {payload}")
+    param_data = payload["properties"]["parameter"]
+
+    rows = []
+    for m in MONTHS:
+        rows.append({
+            "month": m,
+            "avg_temp_C": param_data.get("T2M", {}).get(m),
+            "avg_rainfall_mm_day": param_data.get("PRECTOTCORR", {}).get(m),
+            "avg_solar_kwh_m2_day": param_data.get("ALLSKY_SFC_SW_DWN", {}).get(m),
+        })
+    return {"source": "NASA POWER (power.larc.nasa.gov), community=AG", "monthly": rows}
+
+
+# ==================== STEP 5: LANGCHAIN TOOLS ====================
 @tool
 def crop_recommendation_tool(season: str, region: str) -> str:
     """Recommend suitable crops for a given cropping season and region.
@@ -131,37 +213,30 @@ def profit_calculator_tool(crop: str, land_acres: float, total_cost_rs: float,
     crop: crop name (e.g. 'wheat', 'rice', 'cotton').
     land_acres: land area in acres.
     total_cost_rs: total estimated farming cost in rupees (seeds, labour, fertilizer, irrigation etc).
-    yield_per_acre_override: optional, override default yield (quintal/acre) if user gives their own estimate.
-    price_per_quintal_override: optional, override default market price (Rs/quintal) if user gives their own estimate."""
-    crop_key = crop.strip().lower()
-    econ = CROP_ECONOMICS.get(crop_key)
-    if not econ and (not yield_per_acre_override or not price_per_quintal_override):
-        return (f"No default economic data for '{crop}'. Please supply yield_per_acre_override and "
-                f"price_per_quintal_override so I can calculate profit.")
-
-    yield_per_acre = yield_per_acre_override or econ["yield_per_acre"]
-    price_per_quintal = price_per_quintal_override or econ["price_per_quintal"]
-
-    total_yield = yield_per_acre * land_acres
-    gross_revenue = total_yield * price_per_quintal
-    net_profit = gross_revenue - total_cost_rs
-    roi_pct = (net_profit / total_cost_rs * 100) if total_cost_rs > 0 else 0
-
-    result = {
-        "crop": crop,
-        "land_acres": land_acres,
-        "assumed_yield_per_acre_quintal": yield_per_acre,
-        "assumed_price_per_quintal_rs": price_per_quintal,
-        "total_expected_yield_quintal": round(total_yield, 2),
-        "gross_revenue_rs": round(gross_revenue, 2),
-        "total_cost_rs": total_cost_rs,
-        "net_profit_rs": round(net_profit, 2),
-        "roi_percent": round(roi_pct, 2),
-    }
+    yield_per_acre_override: optional, override default yield (quintal/acre).
+    price_per_quintal_override: optional, override default market price (Rs/quintal)."""
+    try:
+        result = estimate_profit(crop, land_acres, total_cost_rs,
+                                  yield_per_acre_override, price_per_quintal_override)
+    except ValueError as e:
+        return str(e)
     return json.dumps(result, indent=2)
 
 
-TOOLS = [crop_recommendation_tool, profit_calculator_tool]
+@tool
+def nasa_climate_tool(latitude: float, longitude: float) -> str:
+    """Fetch real NASA POWER long-term average monthly temperature, rainfall, and solar
+    radiation for a farm location, to ground crop and irrigation planning in actual
+    satellite/reanalysis climate data instead of guesses. If the user only gave a region
+    name (north/south/east/west) rather than coordinates, use its approximate centroid."""
+    try:
+        data = fetch_nasa_power_climatology(latitude, longitude)
+    except Exception as e:
+        return f"Could not fetch NASA POWER climate data: {e}"
+    return json.dumps(data, indent=2)
+
+
+TOOLS = [crop_recommendation_tool, profit_calculator_tool, nasa_climate_tool]
 
 
 def extract_text(content) -> str:
@@ -180,16 +255,20 @@ def extract_text(content) -> str:
         return "\n".join(p for p in parts if p)
     return str(content)
 
-# ==================== STEP 5: BUILD THE AGENT ====================
+# ==================== STEP 6: BUILD THE AGENT ====================
 SYSTEM_PROMPT = """You are an agricultural planning assistant for Indian farmers.
-You help with two things:
-1. Recommending suitable crops for a season (kharif/rabi/zaid) and region (north/south/east/west) using the crop_recommendation_tool.
-2. Estimating farming profit using the profit_calculator_tool, which needs crop name, land in acres, and total estimated cost in rupees.
+You help with three things:
+1. Recommending suitable crops for a season (kharif/rabi/zaid) and region (north/south/east/west) using crop_recommendation_tool.
+2. Estimating farming profit using profit_calculator_tool (needs crop name, land in acres, total estimated cost in rupees).
+3. Grounding advice in real NASA satellite/reanalysis climate data using nasa_climate_tool (needs latitude and longitude;
+   if the user only gives a region name, use these approximate centroids: north=(28.61,77.21), south=(13.08,80.27),
+   east=(22.57,88.36), west=(19.08,72.88)).
 
 Always use the tools for factual/numeric answers instead of guessing. If the user hasn't given enough
-details (season, region, land size, or cost) ask a short clarifying question before calling a tool.
-Explain the result in simple, farmer-friendly language after the tool responds, and mention this is an
-estimate based on average figures, not a guarantee."""
+details ask a short clarifying question before calling a tool. When climate data is available, mention
+anything notable (e.g. a dry month during the growing season) alongside the crop recommendation.
+Explain results in simple, farmer-friendly language, and mention profit figures are estimates based on
+average data, not a guarantee."""
 
 @st.cache_resource
 def build_agent(_api_key):
@@ -199,45 +278,143 @@ def build_agent(_api_key):
         system_prompt=SYSTEM_PROMPT,
     )
 
-# ==================== STEP 6: SIDEBAR QUICK-CALC (DIRECT TOOL ACCESS) ====================
-st.sidebar.markdown("---")
-st.sidebar.subheader("Quick Profit Calculator")
-qc_crop = st.sidebar.text_input("Crop", value="wheat")
-qc_land = st.sidebar.number_input("Land (acres)", min_value=0.1, value=2.0, step=0.5)
-qc_cost = st.sidebar.number_input("Total Cost (₹)", min_value=0.0, value=25000.0, step=1000.0)
-if st.sidebar.button("Calculate"):
-    st.sidebar.code(profit_calculator_tool.invoke({
-        "crop": qc_crop, "land_acres": qc_land, "total_cost_rs": qc_cost
-    }))
+# ==================== STEP 7: TABBED LAYOUT ====================
+tab_chat, tab_calc, tab_climate = st.tabs(["💬 Chat Advisor", "🧮 Profit Calculator", "🛰️ NASA Climate Data"])
 
-# ==================== STEP 7: CHAT INTERFACE ====================
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# ---------- TAB 1: CHAT ADVISOR ----------
+with tab_chat:
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
 
-for msg in st.session_state.chat_history:
-    role = "user" if isinstance(msg, HumanMessage) else "assistant"
-    with st.chat_message(role):
-        st.write(extract_text(msg.content))
+    for msg in st.session_state.chat_history:
+        role = "user" if isinstance(msg, HumanMessage) else "assistant"
+        with st.chat_message(role):
+            st.write(extract_text(msg.content))
 
-user_question = st.chat_input(
-    "e.g. What should I grow in kharif season in the north, and what's the profit on 3 acres of rice with ₹40000 cost?"
-)
+    user_question = st.chat_input(
+        "e.g. What should I grow in kharif season in the north, and what's the profit on 3 acres of rice with ₹40000 cost?"
+    )
 
-if user_question:
-    if not GOOGLE_API_KEY:
-        st.warning("Please add your GOOGLE_API_KEY in the sidebar first.")
+    if user_question:
+        if not GOOGLE_API_KEY:
+            st.warning("Please add your GOOGLE_API_KEY in the sidebar first.")
+        else:
+            with st.chat_message("user"):
+                st.write(user_question)
+
+            agent = build_agent(GOOGLE_API_KEY)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    history_msgs = st.session_state.chat_history + [HumanMessage(content=user_question)]
+                    response = agent.invoke({"messages": history_msgs})
+                    answer = extract_text(response["messages"][-1].content)
+                    st.write(answer)
+
+            st.session_state.chat_history.append(HumanMessage(content=user_question))
+            st.session_state.chat_history.append(AIMessage(content=answer))
+
+# ---------- TAB 2: PROFIT CALCULATOR (metrics + sensitivity chart + CSV export) ----------
+with tab_calc:
+    st.subheader("Profit Estimator")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        calc_crop = st.text_input("Crop", value="wheat", key="calc_crop")
+    with c2:
+        calc_land = st.number_input("Land (acres)", min_value=0.1, value=2.0, step=0.5, key="calc_land")
+    with c3:
+        calc_cost = st.number_input("Total Cost (₹)", min_value=0.0, value=25000.0, step=1000.0, key="calc_cost")
+
+    if st.button("Calculate Profit", type="primary"):
+        try:
+            result = estimate_profit(calc_crop, calc_land, calc_cost)
+            st.session_state["last_estimate"] = result
+        except ValueError as e:
+            st.error(str(e))
+
+    if "last_estimate" in st.session_state:
+        result = st.session_state["last_estimate"]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Expected Yield", f"{result['total_expected_yield_quintal']} qtl")
+        m2.metric("Gross Revenue", f"₹{result['gross_revenue_rs']:,.0f}")
+        m3.metric("Net Profit", f"₹{result['net_profit_rs']:,.0f}")
+        m4.metric("ROI", f"{result['roi_percent']:.1f}%")
+
+        st.markdown("##### Profit Sensitivity to Market Price (±20%)")
+        price = result["assumed_price_per_quintal_rs"]
+        rows = []
+        for pct in range(-20, 21, 5):
+            adj_price = price * (1 + pct / 100)
+            adj = estimate_profit(
+                result["crop"], result["land_acres"], result["total_cost_rs"],
+                price_per_quintal_override=adj_price,
+            )
+            rows.append({"price_change_%": pct, "net_profit_rs": adj["net_profit_rs"]})
+        sens_df = pd.DataFrame(rows).set_index("price_change_%")
+        st.line_chart(sens_df)
+
+        st.markdown("##### Download Report")
+        report_df = pd.DataFrame([result])
+        csv_bytes = report_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Estimate as CSV",
+            data=csv_bytes,
+            file_name=f"{result['crop']}_profit_estimate.csv",
+            mime="text/csv",
+        )
     else:
-        with st.chat_message("user"):
-            st.write(user_question)
+        st.info("Enter your crop, land size, and cost above, then click Calculate Profit.")
 
-        agent = build_agent(GOOGLE_API_KEY)
+# ---------- TAB 3: NASA CLIMATE DATA ----------
+with tab_climate:
+    st.subheader("NASA POWER Climate Normals")
+    st.caption(
+        "Real long-term monthly climate data from NASA's POWER project (power.larc.nasa.gov) — "
+        "the same public agroclimatology dataset used in food-security and land-monitoring research."
+    )
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                history_msgs = st.session_state.chat_history + [HumanMessage(content=user_question)]
-                response = agent.invoke({"messages": history_msgs})
-                answer = extract_text(response["messages"][-1].content)
-                st.write(answer)
+    region_choice = st.selectbox("Quick-fill from region", ["Custom", "North", "South", "East", "West"])
+    if region_choice != "Custom":
+        default_lat, default_lon = REGION_COORDS[region_choice.lower()]
+    else:
+        default_lat, default_lon = 20.59, 78.96  # India centroid
 
-        st.session_state.chat_history.append(HumanMessage(content=user_question))
-        st.session_state.chat_history.append(AIMessage(content=answer))
+    lc1, lc2 = st.columns(2)
+    with lc1:
+        lat = st.number_input("Latitude", value=float(default_lat), format="%.4f")
+    with lc2:
+        lon = st.number_input("Longitude", value=float(default_lon), format="%.4f")
+
+    if st.button("Fetch NASA Climate Data"):
+        with st.spinner("Contacting NASA POWER API..."):
+            try:
+                climate = fetch_nasa_power_climatology(lat, lon)
+                st.session_state["last_climate"] = climate
+            except Exception as e:
+                st.error(f"Could not fetch NASA climate data: {e}")
+
+    if "last_climate" in st.session_state:
+        climate = st.session_state["last_climate"]
+        df = pd.DataFrame(climate["monthly"]).set_index("month")
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.markdown("**Avg Temperature (°C)**")
+            st.line_chart(df[["avg_temp_C"]])
+        with cc2:
+            st.markdown("**Avg Rainfall (mm/day)**")
+            st.bar_chart(df[["avg_rainfall_mm_day"]])
+
+        st.markdown("**Avg Solar Radiation (kWh/m²/day)**")
+        st.line_chart(df[["avg_solar_kwh_m2_day"]])
+
+        st.caption(f"Source: {climate['source']}")
+
+        csv_bytes = df.reset_index().to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Climate Data as CSV",
+            data=csv_bytes,
+            file_name=f"nasa_power_climatology_{lat}_{lon}.csv",
+            mime="text/csv",
+        )
