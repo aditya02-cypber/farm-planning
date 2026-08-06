@@ -127,6 +127,23 @@ def profit_calculator_tool(crop: str, land_acres: float, total_cost_rs: float,
 
 TOOLS = [crop_recommendation_tool, profit_calculator_tool]
 
+
+def extract_text(content) -> str:
+    """Gemini 3.x can return message.content as a plain string OR a list of
+    content blocks like {"type": "text", "text": "...", "extras": {...}}.
+    Normalize either shape down to plain text for display."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
 # ==================== STEP 5: BUILD THE AGENT ====================
 SYSTEM_PROMPT = """You are an agricultural planning assistant for Indian farmers.
 You help with two things:
@@ -164,7 +181,7 @@ if "chat_history" not in st.session_state:
 for msg in st.session_state.chat_history:
     role = "user" if isinstance(msg, HumanMessage) else "assistant"
     with st.chat_message(role):
-        st.write(msg.content)
+        st.write(extract_text(msg.content))
 
 user_question = st.chat_input(
     "e.g. What should I grow in kharif season in the north, and what's the profit on 3 acres of rice with ₹40000 cost?"
@@ -183,7 +200,7 @@ if user_question:
             with st.spinner("Thinking..."):
                 history_msgs = st.session_state.chat_history + [HumanMessage(content=user_question)]
                 response = agent.invoke({"messages": history_msgs})
-                answer = response["messages"][-1].content
+                answer = extract_text(response["messages"][-1].content)
                 st.write(answer)
 
         st.session_state.chat_history.append(HumanMessage(content=user_question))
