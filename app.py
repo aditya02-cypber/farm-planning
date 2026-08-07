@@ -49,11 +49,18 @@ st.markdown(
         border-radius: 4px;
     }}
     [data-testid="stMetric"] {{
-        background-color: rgba(255, 255, 255, 0.92);
+        background-color: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.25);
         border-radius: 12px;
         padding: 12px;
     }}
-    [data-testid="stMetric"] label, [data-testid="stMetric"] div {{ color: #1a1a1a !important; }}
+    [data-testid="stMetric"] label,
+    [data-testid="stMetric"] div,
+    [data-testid="stMetricLabel"] *,
+    [data-testid="stMetricValue"] *,
+    [data-testid="stMetricDelta"] * {{
+        color: #f2f2ea !important;
+    }}
     [data-testid="stTabs"] button p {{ color: #f2f2ea; font-weight: 600; }}
     </style>
     """,
